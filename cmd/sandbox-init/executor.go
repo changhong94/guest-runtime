@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -193,6 +194,24 @@ func (c *executorClient) attachSession(conn *vsockConn) (bool, error) {
 	return c.transfer(ctx, executorMessage{Op: "attach"}, conn)
 }
 
+func (c *executorClient) reattachSessionAck(conn *vsockConn, epoch uint32, ack string) (bool, error) {
+	return c.reattachSessionInitAck(conn, epoch, ack, nil)
+}
+func (c *executorClient) reattachSessionInitAck(conn *vsockConn, epoch uint32, ack string, initBody json.RawMessage) (bool, error) {
+	started := time.Now()
+	c.admission.Lock()
+	admitted := time.Now()
+	defer c.admission.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	handed, err := c.transfer(ctx, executorMessage{Op: "resume_attach", Request: &proto.Message{Type: ack, Epoch: epoch, RestoreEnvdInit: initBody}}, conn)
+	logf("restore stages executor_lock_ns=%d executor_rpc_ns=%d", admitted.Sub(started).Nanoseconds(), time.Since(admitted).Nanoseconds())
+	if err == nil {
+		c.paused = false
+	}
+	return handed, err
+}
+
 func (c *executorClient) shutdown() {
 	if !c.stopping.CompareAndSwap(false, true) {
 		return
@@ -297,7 +316,7 @@ func (e *innerExecutor) handle(msg executorMessage, fd *int) (executorMessage, e
 		return executorMessage{}, errors.New("workload not launched")
 	}
 	switch msg.Op {
-	case "session", "attach":
+	case "session", "attach", "resume_attach":
 		conn, err := takeExecutorConn(fd)
 		if err != nil {
 			return executorMessage{}, err
@@ -308,6 +327,12 @@ func (e *innerExecutor) handle(msg executorMessage, fd *int) (executorMessage, e
 				err = errors.New("missing session request")
 			} else {
 				handed, err = sup.runSession(conn, msg.Request)
+			}
+		} else if msg.Op == "resume_attach" {
+			if msg.Request == nil || (msg.Request.Type != proto.TypeRestoreAck && msg.Request.Type != proto.TypeForkRestoreAck && msg.Request.Type != proto.TypeAttachAck) {
+				err = errors.New("invalid reattach acknowledgment")
+			} else {
+				handed, err = reattachExecutionInitAck(conn, sup, msg.Request.Epoch, msg.Request.Type, msg.Request.RestoreEnvdInit)
 			}
 		} else {
 			handed, err = sup.attachSession(conn)
@@ -398,7 +423,7 @@ func (s *supervisorState) quiesce() error {
 	closeConnectSessions(s.connReg, s.acceptLn)
 	s.sessions.Wait()
 	s.bridge.closeLiveMUX()
-	return nil
+	return prepareLocalInitConnection()
 }
 
 func (s *supervisorState) prepareReattach() error {

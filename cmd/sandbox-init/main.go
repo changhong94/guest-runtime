@@ -9,6 +9,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -131,6 +132,17 @@ func main() {
 
 	// runtime_ready is the hello itself. The host may defer its launch reply for
 	// an arbitrary assignment interval; that interval is not launch execution.
+	// These are the same immutable runtime binaries for every workload image.
+	// Populate their guest page cache before advertising the generic slot, but
+	// never execute a tenant interpreter or inspect a tenant image here.
+	payloadStart := time.Now()
+	for _, payload := range []string{"/proc/self/exe", "/opt/sandbox-runtime/bin/envd", "/opt/sandbox-runtime/bin/exec-wrapper"} {
+		if f, e := os.Open(payload); e == nil {
+			_, _ = io.Copy(io.Discard, f)
+			_ = f.Close()
+		}
+	}
+	logf("generic runtime payload read completed in %s", time.Since(payloadStart))
 	spec, conn, err := waitForLaunch()
 	if err != nil {
 		die("launch handshake: %v", err)
@@ -138,17 +150,24 @@ func main() {
 	initialLaunch.begin(spec.InitialLaunchToken)
 	logf("runtime ready: launch spec received; assembling workload root")
 
+	launchPhaseStart := time.Now()
 	if err := phaseWorkloadRoot(spec); err != nil {
 		die("workload root: %v", err)
 	}
+	logf("workload launch phase=root elapsed=%s", time.Since(launchPhaseStart))
+	launchPhaseStart = time.Now()
 	if err := applyEnvironment(spec); err != nil {
 		die("apply environment: %v", err)
 	}
+	logf("workload launch phase=environment elapsed=%s", time.Since(launchPhaseStart))
+	launchPhaseStart = time.Now()
 	client, child, err := startExecutor(spec)
 	if err != nil {
 		die("start inner init: %v", err)
 	}
+	logf("workload launch phase=executor elapsed=%s", time.Since(launchPhaseStart))
 	executor.Store(client)
+	launchPhaseStart = time.Now()
 	if err := client.launch(conn); err != nil {
 		initialLaunch.failed(err)
 		logf("inner launch failed: %v", err)
@@ -156,6 +175,7 @@ func main() {
 		_ = child.Wait()
 		doReboot()
 	}
+	logf("workload launch phase=primary-ready elapsed=%s", time.Since(launchPhaseStart))
 	exit := make(chan error, 1)
 	go func() { exit <- child.Wait() }()
 	select {
@@ -224,6 +244,8 @@ func phaseBaseRuntime() error {
 // phaseWorkloadRoot begins only after host storage commit. It is the first
 // phase that probes or mounts workload block devices.
 func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
+	rootStarted := time.Now()
+	markRoot := func(phase string) { logf("workload launch root_phase=%s elapsed=%s", phase, time.Since(rootStarted)) }
 	ext4Options, err := ext4MountOptions(spec.Ext4Discard)
 	if err != nil {
 		return err
@@ -246,14 +268,17 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 		if err := waitForDevice("/dev/vdb", devicePollTimeout); err != nil {
 			return fmt.Errorf("wait /dev/vdb: %w", err)
 		}
+		markRoot("devices_ready")
 		logf("phase1a: vda+vdb present")
 
 		if err := unix.Mount("/dev/vda", "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("mount blk0 (erofs ro) on /overlay/lower: %w", err)
 		}
+		markRoot("lower_mounted")
 		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("mount blk1 (ext4 rw) on /overlay/upper: %w", err)
 		}
+		markRoot("upper_mounted")
 		if err := os.MkdirAll("/overlay/upper/upperdir", 0o755); err != nil {
 			return fmt.Errorf("mkdir upperdir: %w", err)
 		}
@@ -268,6 +293,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 		logf("phase1a: overlay assembled at /sysroot")
 	}
 
+	markRoot("root_mounted")
 	for _, dir := range []string{"/sysroot/proc", "/sysroot/sys", "/sysroot/dev"} {
 		_ = os.MkdirAll(dir, 0o755)
 	}
@@ -293,6 +319,7 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 		return fmt.Errorf("bind /opt/sandbox-runtime into sysroot: %w", err)
 	}
 
+	markRoot("runtime_bound")
 	logf("phase1a: /sysroot ready (runtime payload bound)")
 	runDir, err := mountRunDirs("/sysroot")
 	if err != nil {
@@ -306,12 +333,15 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 	if err != nil {
 		return err
 	}
+	markRoot("run_mounted")
 	if err := applyVolumeMounts(spec, ext4Options, runDir); err != nil {
 		return fmt.Errorf("apply volume mounts: %w", err)
 	}
+	markRoot("volumes_mounted")
 	if err := phase1bSwitchRoot(spec.CgroupControl); err != nil {
 		return fmt.Errorf("switch root: %w", err)
 	}
+	markRoot("root_switched")
 	if err := guestSlots.protectDevices(); err != nil {
 		return err
 	}
@@ -1073,6 +1103,14 @@ func logf(format string, args ...any) {
 	elapsedMs := time.Since(initStart).Milliseconds()
 	fmt.Fprintf(os.Stderr, "[sandbox-init][T+%dms] "+format+"\n",
 		append([]any{elapsedMs}, args...)...)
+	// Console-less guests still expose these diagnostic timings through the
+	// kernel ring buffer. Never write tenant arguments or environment values.
+	if strings.HasPrefix(format, "workload launch ") || strings.HasPrefix(format, "restore stages ") {
+		if f, err := os.OpenFile("/dev/kmsg", os.O_WRONLY, 0); err == nil {
+			fmt.Fprintf(f, "<6>"+format+"\n", args...)
+			_ = f.Close()
+		}
+	}
 }
 
 func die(format string, args ...any) {

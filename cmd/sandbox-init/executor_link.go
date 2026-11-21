@@ -22,15 +22,16 @@ import (
 // This protocol is private to two instances of the same executable. It is
 // preserved together with them in a memory snapshot, not exposed as a Host ABI.
 type executorMessage struct {
-	ID      uint64            `json:"id,omitempty"`
-	Reply   bool              `json:"reply,omitempty"`
-	Op      string            `json:"op,omitempty"`
-	Error   string            `json:"error,omitempty"`
-	Launch  *proto.LaunchSpec `json:"launch,omitempty"`
-	Request *proto.Message    `json:"request,omitempty"`
-	PID     int               `json:"pid,omitempty"`
-	Code    int               `json:"code,omitempty"`
-	Signal  int               `json:"signal,omitempty"`
+	TraceSentNS int64             `json:"trace_sent_ns,omitempty"`
+	ID          uint64            `json:"id,omitempty"`
+	Reply       bool              `json:"reply,omitempty"`
+	Op          string            `json:"op,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Launch      *proto.LaunchSpec `json:"launch,omitempty"`
+	Request     *proto.Message    `json:"request,omitempty"`
+	PID         int               `json:"pid,omitempty"`
+	Code        int               `json:"code,omitempty"`
+	Signal      int               `json:"signal,omitempty"`
 }
 
 type executorReply struct {
@@ -211,6 +212,14 @@ func (l *executorLink) receive() (_ executorMessage, fd int, err error) {
 // A handler takes ownership of a descriptor by setting *fd to -1. Requests may
 // call back over the same channel, so only the reader matches replies, and each
 // handler runs separately. Lifecycle handlers provide their own serialization.
+func executorMonotonicNS() int64 {
+	var ts unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
+		return 0
+	}
+	return ts.Nano()
+}
+
 func (l *executorLink) serve(handler func(executorMessage, *int) (executorMessage, error)) {
 	defer l.close()
 	for {
@@ -234,19 +243,25 @@ func (l *executorLink) serve(handler func(executorMessage, *int) (executorMessag
 			}
 			continue
 		}
+		receivedNS := executorMonotonicNS()
 		go func(msg executorMessage, fd int) {
+			startedNS := executorMonotonicNS()
 			defer func() {
 				if fd >= 0 {
 					_ = unix.Close(fd)
 				}
 			}()
 			resp, err := handler(msg, &fd)
+			handledNS := executorMonotonicNS()
 			resp.ID, resp.Reply = msg.ID, true
 			if err != nil {
 				resp.Error = err.Error()
 			}
 			if msg.ID != 0 {
 				_ = l.send(resp, -1)
+			}
+			if msg.Op == "resume_attach" && msg.TraceSentNS > 0 {
+				logf("restore stages ipc_id=%d ipc_inbound_ns=%d ipc_dispatch_ns=%d ipc_handler_ns=%d ipc_reply_send_ns=%d", msg.ID, receivedNS-msg.TraceSentNS, startedNS-receivedNS, handledNS-startedNS, executorMonotonicNS()-handledNS)
 			}
 		}(msg, fd)
 	}
@@ -264,9 +279,18 @@ func (l *executorLink) call(ctx context.Context, msg executorMessage, fd int) (e
 		delete(l.pending, msg.ID)
 		l.mu.Unlock()
 	}()
+	if msg.Op == "resume_attach" {
+		msg.TraceSentNS = executorMonotonicNS()
+	}
 	if err := l.sendContext(ctx, msg, fd); err != nil {
 		return executorMessage{}, err
 	}
+	sendDoneNS := executorMonotonicNS()
+	defer func() {
+		if msg.TraceSentNS > 0 {
+			logf("restore stages ipc_call_id=%d ipc_send_ns=%d ipc_wait_ns=%d", msg.ID, sendDoneNS-msg.TraceSentNS, executorMonotonicNS()-sendDoneNS)
+		}
+	}()
 	select {
 	case reply := <-waiter:
 		return reply.message, reply.err

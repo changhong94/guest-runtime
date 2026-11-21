@@ -1,0 +1,85 @@
+--- a/internal/api/init.go
++++ b/internal/api/init.go
+@@ -9,6 +9,7 @@
+ 	"maps"
+ 	"net/http"
+ 	"net/netip"
++	"os"
+ 	"os/exec"
+ 	"slices"
+ 	"strings"
+@@ -113,6 +114,25 @@
+ }
+ 
+ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
++	traceEnabled := r.Header.Get("X-Kuasar-Init-Timing") == "1"
++	traceStart := time.Now()
++	var traceMarks []string
++	mark := func(name string) {
++		if traceEnabled {
++			traceMarks = append(traceMarks, fmt.Sprintf("%s_ns=%d", name, time.Since(traceStart).Nanoseconds()))
++		}
++	}
++	defer func() {
++		if !traceEnabled {
++			return
++		}
++		mark("done")
++		if f, err := os.OpenFile("/dev/kmsg", os.O_WRONLY, 0); err == nil {
++			fmt.Fprintf(f, "<6>envd init stages %s\n", strings.Join(traceMarks, " "))
++			f.Close()
++		}
++	}()
++
+ 	defer r.Body.Close()
+ 
+ 	ctx := r.Context()
+@@ -123,6 +143,7 @@
+ 	if r.Body != nil {
+ 		// Read raw body so we can wipe it after parsing
+ 		body, err := io.ReadAll(r.Body)
++		mark("body")
+ 		// Ensure body is wiped after we're done
+ 		defer memguard.WipeBytes(body)
+ 		if err != nil {
+@@ -148,12 +169,14 @@
+ 		// Safe because Destroy() is nil-safe and TakeFrom clears the source.
+ 		defer initRequest.AccessToken.Destroy()
+ 
++		mark("decoded")
+ 		if err := a.initLock.Acquire(ctx, 1); err != nil {
+ 			w.WriteHeader(http.StatusServiceUnavailable)
+ 
+ 			return
+ 		}
+ 		defer a.initLock.Release(1)
++		mark("locked")
+ 
+ 		// Validate auth before installing the unfreeze defer or running SetData,
+ 		// so stale/replayed but unauthorized requests can't thaw cgroups.
+@@ -165,7 +188,8 @@
+ 
+ 		// Run on every /init regardless of the Timestamp guard, so stale/replayed
+ 		// requests still thaw cgroups after pre-pause freeze.
+-		defer a.unfreezeUserCgroups(ctx, logger)
++		mark("authorized")
++		defer func() { mark("thaw_start"); a.unfreezeUserCgroups(ctx, logger); mark("thaw_done") }()
+ 
+ 		// Update data only if the request is newer or if there's no timestamp at all
+ 		if initRequest.Timestamp == nil || a.lastSetTime.SetToGreater(initRequest.Timestamp.UnixNano()) {
+@@ -177,6 +201,7 @@
+ 		}
+ 	}
+ 
++	mark("data_set")
+ 	go func() { //nolint:contextcheck // TODO: fix this later
+ 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+ 		defer cancel()
+@@ -186,6 +211,7 @@
+ 	w.Header().Set("Cache-Control", "no-store")
+ 
+ 	w.WriteHeader(http.StatusNoContent)
++	mark("response")
+ }
+ 
+ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJSONBody) error {

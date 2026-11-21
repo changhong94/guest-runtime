@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -370,7 +373,7 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 		return false
 	}
 	switch req.Type {
-	case proto.TypeShutdown, proto.TypeQuiesce, proto.TypeRestore, proto.TypeAttach:
+	case proto.TypeShutdown, proto.TypeQuiesce, proto.TypeRestore, proto.TypeForkRestore, proto.TypeAttach:
 		managementLifecycle.Lock()
 		defer managementLifecycle.Unlock()
 		if client, ok := execution.(*executorClient); ok && client.stopping.Load() && req.Type != proto.TypeShutdown {
@@ -412,7 +415,18 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 		}
 		return handed
 
-	case proto.TypeRestore:
+	case proto.TypeRestore, proto.TypeForkRestore:
+		stageStart := time.Now()
+		stageLast := stageStart
+		var stageParts []string
+		stage := func(name string) {
+			now := time.Now()
+			stageParts = append(stageParts, fmt.Sprintf("%s=%d", name, now.Sub(stageLast).Nanoseconds()))
+			stageLast = now
+		}
+		defer func() {
+			logf("restore stages ns %s total=%d", strings.Join(stageParts, " "), time.Since(stageStart).Nanoseconds())
+		}()
 		if execution == nil {
 			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
 			return false
@@ -424,6 +438,7 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 			logf("usage restore barrier: %v", usageErr)
 			return false
 		}
+		stage("usage_pause")
 		logf("reverse-channel: restore epoch=%d — re-establishing stdio MUX", req.Epoch)
 		// CH reloaded the snapshot's CLOCK_REALTIME verbatim, so the
 		// guest wall clock is stale by the whole dormant interval. Jump
@@ -444,14 +459,48 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 		// identity). Best-effort + logged, like clock_settime: applied before
 		// the thaw so the app resumes onto the new identity. nil → keep the
 		// snapshot's network.
+		stage("clock")
+		if req.Type == proto.TypeForkRestore {
+			// Workload is frozen and the host TAP remains gated until ACK.
+			var keepIP net.IP
+			if req.Network != nil {
+				keepIP, _, _ = net.ParseCIDR(req.Network.IPCIDR)
+			}
+			// Socket cleanup and CRNG reseeding touch independent state. Join
+			// both before networking, thaw, or publishing the restore ACK.
+			if err := joinForkIdentity(
+				func() error {
+					return checkForkSocketIdentity(
+						func() error { return validateInheritedSocketTables(os.ReadFile, []string{"udp", "udp6"}, keepIP) },
+						func() error { return resetInheritedTCP(keepIP) },
+					)
+				},
+				func() error { return reseedForkKernel(req.ForkEntropy) },
+			); err != nil {
+				_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+				return false
+			}
+			stage("socket_identity_and_entropy")
+			if req.Network != nil {
+				if err := validateForkNetwork(req.Network); err != nil {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+					return false
+				}
+			}
+		}
 		if req.Network != nil {
 			logf("reverse-channel: restore network re-apply starting (epoch=%d)", req.Epoch)
 			if err := applyNetworkReplace(req.Network); err != nil {
 				logf("reverse-channel: restore applyNetwork: %v", err)
+				if req.Type == proto.TypeForkRestore {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+					return false
+				}
 			} else {
 				logf("reverse-channel: restore network re-applied (epoch=%d)", req.Epoch)
 			}
 		}
+		stage("network")
 		// Establish a new observation epoch and pause sampling before
 		// restore_ack. This serializes with an in-flight mem_report exchange, so
 		// neither an old-epoch delivery nor a pre-ACK sample can become the first
@@ -463,11 +512,17 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 			return false
 		}
 		logf("reverse-channel: restore mem_report epoch=%d", reportEpoch)
-		handed, err := finishReattach(c, execution, req.Epoch, true, cgroupThaw)
+		ack := proto.TypeRestoreAck
+		if req.Type == proto.TypeForkRestore {
+			ack = proto.TypeForkRestoreAck
+		}
+		stage("report_epoch")
+		handed, err := finishReattachAck(c, execution, req.Epoch, true, cgroupThaw, ack, req.RestoreEnvdInit)
 		if err != nil {
 			logf("reverse-channel: %v", err)
 			return handed
 		}
+		stage("reattach_thaw_ack")
 		// Restore, like cold boot, sends the first trustworthy observation
 		// immediately after its lifecycle barrier instead of waiting up to one
 		// periodic interval.
@@ -561,9 +616,24 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 // finishReattach is the thaw/ACK/MUX boundary. The narrow thaw seam also lets
 // socket tests hold this boundary without freezing the test process's cgroup.
 func finishReattach(c *vsockConn, execution executionControl, epoch uint32, newHost bool, thaw func() error) (_ bool, err error) {
-	ack, operation := proto.TypeAttachAck, "attach"
+	ack := proto.TypeAttachAck
 	if newHost {
-		ack, operation = proto.TypeRestoreAck, "restore"
+		ack = proto.TypeRestoreAck
+	}
+	return finishReattachAck(c, execution, epoch, newHost, thaw, ack)
+}
+
+func finishReattachAck(c *vsockConn, execution executionControl, epoch uint32, newHost bool, thaw func() error, ack string, initBody ...json.RawMessage) (_ bool, err error) {
+	traceStart := time.Now()
+	var usageDone, thawDone, transferDone time.Time
+	defer func() {
+		if newHost && !transferDone.IsZero() {
+			logf("restore stages outer_usage_ns=%d outer_thaw_ns=%d outer_transfer_ns=%d", usageDone.Sub(traceStart).Nanoseconds(), thawDone.Sub(usageDone).Nanoseconds(), transferDone.Sub(thawDone).Nanoseconds())
+		}
+	}()
+	operation := "attach"
+	if newHost {
+		operation = "restore"
 	}
 	// The Host starts its immediate usage round as soon as it receives the
 	// ACK. Admit raw reads first; unlike exec and mem_report, these neither
@@ -580,6 +650,7 @@ func finishReattach(c *vsockConn, execution executionControl, epoch uint32, newH
 			}
 		}
 	}()
+	usageDone = time.Now()
 	// ACK is the host's readiness barrier. Complete thaw and reopen launch
 	// gates before publishing it: the host may deliver exec immediately.
 	// Thaw only writes the freezer control file; it does not wait for the
@@ -590,20 +661,30 @@ func finishReattach(c *vsockConn, execution executionControl, epoch uint32, newH
 			return false, fmt.Errorf("%s thaw: %w", operation, err)
 		}
 	}
-	// Only after thaw can the inner acknowledge its local readiness. This
-	// includes opening exec gates before the Host can act on the ACK.
-	if err := execution.prepareReattach(); err != nil {
-		return false, fmt.Errorf("%s readiness: %w", operation, err)
+	thawDone = time.Now()
+	// The production inner executor can acknowledge readiness and take the
+	// MUX in one private RPC. It writes ACK only after reopening its gates.
+	var handed bool
+	if len(initBody) == 1 && len(initBody[0]) > 0 {
+		if combined, ok := execution.(interface {
+			reattachSessionInitAck(*vsockConn, uint32, string, json.RawMessage) (bool, error)
+		}); ok {
+			handed, err = combined.reattachSessionInitAck(c, epoch, ack, initBody[0])
+		} else {
+			handed, err = reattachExecutionAck(c, execution, epoch, ack)
+		}
+	} else if combined, ok := execution.(interface {
+		reattachSessionAck(*vsockConn, uint32, string) (bool, error)
+	}); ok {
+		handed, err = combined.reattachSessionAck(c, epoch, ack)
+	} else {
+		handed, err = reattachExecutionAck(c, execution, epoch, ack)
 	}
-	spec := execution.stdioSpec()
-	resp := &proto.Message{Type: ack, Epoch: epoch, Stdio: &spec, AppState: proto.AppStateRunning}
-	if err := proto.WriteMessage(c, resp); err != nil {
-		return false, fmt.Errorf("write %s_ack: %w", operation, err)
-	}
-	handed, err := execution.attachSession(c)
+	transferDone = time.Now()
 	if err != nil {
-		return handed, fmt.Errorf("%s MUX handoff: %w", operation, err)
+		return handed, fmt.Errorf("%s readiness/MUX: %w", operation, err)
 	}
+
 	// Resource observations must still start after ACK/MUX establishment,
 	// even though execution is already eligible before the host sees ACK.
 	guestMemReports.resumeEpoch()
@@ -757,4 +838,34 @@ func notifyAppExited(code, sig int) {
 	if _, err := proto.ReadMessage(conn); err != nil {
 		logf("app_exited notify: read ack: %v (continuing reboot)", err)
 	}
+}
+
+// reattachExecutionAck runs in the inner init for production transfers. No ACK
+// is sent until readiness succeeds; MUX frames cannot precede that ACK.
+func reattachExecutionAck(c *vsockConn, execution executionControl, epoch uint32, ack string) (bool, error) {
+	return reattachExecutionInitAck(c, execution, epoch, ack, nil)
+}
+func reattachExecutionInitAck(c *vsockConn, execution executionControl, epoch uint32, ack string, initBody json.RawMessage) (bool, error) {
+	started := time.Now()
+	var prepared, initialized time.Time
+	defer func() {
+		if !initialized.IsZero() {
+			logf("restore stages inner_prepare_ns=%d envd_init_ns=%d ack_mux_ns=%d", prepared.Sub(started).Nanoseconds(), initialized.Sub(prepared).Nanoseconds(), time.Since(initialized).Nanoseconds())
+		}
+	}()
+	if err := execution.prepareReattach(); err != nil {
+		return false, err
+	}
+	prepared = time.Now()
+	if len(initBody) > 0 {
+		if err := initializeRestoredEnvd(initBody); err != nil {
+			return false, err
+		}
+	}
+	initialized = time.Now()
+	spec := execution.stdioSpec()
+	if err := proto.WriteMessage(c, &proto.Message{Type: ack, Epoch: epoch, Stdio: &spec, AppState: proto.AppStateRunning, RestoreEnvdInitialized: len(initBody) > 0}); err != nil {
+		return false, err
+	}
+	return execution.attachSession(c)
 }

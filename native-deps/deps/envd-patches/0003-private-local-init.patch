@@ -1,0 +1,201 @@
+--- a/main.go
++++ b/main.go
+@@ -2,9 +2,11 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"log"
++	"net"
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
+@@ -216,6 +218,29 @@
+ 		WriteTimeout: 0,
+ 		IdleTimeout:  idleTimeout,
+ 	}
++	// Private local initialization keeps the ordinary middleware and handler.
++	// A new socket is opened for every restore; no TCP session is inherited.
++	if isNotFC {
++		listener, err := listenLocalInit("/run/kuasar-envd-init")
++		if err != nil {
++			return fmt.Errorf("local init listener: %w", err)
++		}
++		defer listener.Close()
++		initHandler := s.Handler
++		local := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.Method != http.MethodPost || r.URL.Path != "/init" {
++				http.NotFound(w, r)
++				return
++			}
++			initHandler.ServeHTTP(w, r)
++		}), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 0}
++		defer local.Close()
++		go func() {
++			if err := local.Serve(listener); err != nil && err != http.ErrServerClosed && !errors.Is(err, net.ErrClosed) {
++				log.Printf("local init listener stopped: %v", err)
++			}
++		}()
++	}
+ 	httpserver.ConfigureH2C(s)
+ 
+ 	// Bind all open ports on 127.0.0.1 and localhost to the eth0 interface
+--- /dev/null
++++ b/local_init.go
+@@ -0,0 +1,91 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"time"
++)
++
++type localInitListener struct {
++	net.Listener
++	lock *os.File
++	once sync.Once
++	err  error
++}
++
++func (l *localInitListener) Close() error {
++	l.once.Do(func() { l.err = l.Listener.Close(); l.lock.Close() })
++	return l.err
++}
++
++// The lifetime lock serializes restarts. Remove only an owned, refused stale
++// socket left after a crash, never a live listener or a substituted pathname.
++func listenLocalInit(dir string) (net.Listener, error) {
++	if err := os.Mkdir(dir, 0700); err != nil && !os.IsExist(err) {
++		return nil, err
++	}
++	st, err := os.Lstat(dir)
++	if err != nil {
++		return nil, err
++	}
++	owner, ok := st.Sys().(*syscall.Stat_t)
++	if !st.IsDir() || st.Mode().Perm() != 0700 || !ok || owner.Uid != uint32(os.Geteuid()) {
++		return nil, fmt.Errorf("unsafe init directory")
++	}
++	fd, err := syscall.Open(filepath.Join(dir, "owner.lock"), syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
++	if err != nil {
++		return nil, err
++	}
++	lock := os.NewFile(uintptr(fd), "init-lock")
++	keep := false
++	defer func() {
++		if !keep {
++			lock.Close()
++		}
++	}()
++	if err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
++		return nil, err
++	}
++	path := filepath.Join(dir, "init.sock")
++	if st, err := os.Lstat(path); err == nil {
++		owner, ok := st.Sys().(*syscall.Stat_t)
++		if st.Mode()&os.ModeSocket == 0 || !ok || owner.Uid != uint32(os.Geteuid()) {
++			return nil, errors.New("unsafe init socket")
++		}
++		c, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
++		if dialErr == nil {
++			c.Close()
++			return nil, errors.New("init listener already running")
++		}
++		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
++			return nil, dialErr
++		}
++		current, err := os.Lstat(path)
++		if err != nil {
++			return nil, err
++		}
++		if !os.SameFile(st, current) {
++			return nil, errors.New("init socket changed")
++		}
++		if err = os.Remove(path); err != nil {
++			return nil, err
++		}
++	} else if !os.IsNotExist(err) {
++		return nil, err
++	}
++	l, err := net.Listen("unix", path)
++	if err != nil {
++		return nil, err
++	}
++	if err = os.Chmod(path, 0600); err != nil {
++		l.Close()
++		return nil, err
++	}
++	keep = true
++	return &localInitListener{Listener: l, lock: lock}, nil
++}
+--- /dev/null
++++ b/local_init_test.go
+@@ -0,0 +1,60 @@
++package main
++
++import (
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestLocalInitListener(t *testing.T) {
++	d := filepath.Join(t.TempDir(), "private")
++	l, e := listenLocalInit(d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	if st, e := os.Stat(filepath.Join(d, "init.sock")); e != nil || st.Mode().Perm() != 0600 {
++		t.Fatal("socket not private")
++	}
++	if other, e := listenLocalInit(d); e == nil {
++		other.Close()
++		t.Fatal("replaced live socket")
++	}
++}
++func TestLocalInitRejectsUnsafeDir(t *testing.T) {
++	d := filepath.Join(t.TempDir(), "unsafe")
++	os.Mkdir(d, 0755)
++	if l, e := listenLocalInit(d); e == nil {
++		l.Close()
++		t.Fatal("unsafe dir accepted")
++	}
++	s := filepath.Join(t.TempDir(), "link")
++	os.Symlink(d, s)
++	if l, e := listenLocalInit(s); e == nil {
++		l.Close()
++		t.Fatal("symlink accepted")
++	}
++}
++func TestLocalInitRecoversStaleSocket(t *testing.T) {
++	d := filepath.Join(t.TempDir(), "private")
++	if e := os.Mkdir(d, 0700); e != nil {
++		t.Fatal(e)
++	}
++	stale, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(d, "init.sock"), Net: "unix"})
++	if e != nil {
++		t.Fatal(e)
++	}
++	stale.SetUnlinkOnClose(false)
++	stale.Close()
++	l, e := listenLocalInit(d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	l.Close()
++	l, e = listenLocalInit(d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	l.Close()
++}

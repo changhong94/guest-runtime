@@ -2,6 +2,8 @@ package proto
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"reflect"
 	"testing"
 )
@@ -396,5 +398,30 @@ func TestRoundTrip_MemReport(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, m) {
 		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", got, m)
+	}
+}
+
+type failingFrameWriter struct {
+	err   error
+	calls int
+	count int
+}
+
+func (w *failingFrameWriter) Write(p []byte) (int, error) {
+	w.calls++
+	return min(w.count, len(p)), w.err
+}
+func TestFrameWritePropagatesPartialFailure(t *testing.T) {
+	sentinel := errors.New("broken transport")
+	for _, n := range []int{0, 2, 4, 8} {
+		w := &failingFrameWriter{err: sentinel, count: n}
+		err := WriteMessage(w, &Message{Type: TypeRestore})
+		if !errors.Is(err, sentinel) || w.calls != 1 {
+			t.Fatalf("replayed partial failed frame: %v calls=%d", err, w.calls)
+		}
+	}
+	w := &failingFrameWriter{}
+	if !errors.Is(WriteMessage(w, &Message{Type: TypeRestore}), io.ErrShortWrite) {
+		t.Fatal("ignored zero-progress writer")
 	}
 }

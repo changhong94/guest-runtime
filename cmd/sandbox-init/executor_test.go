@@ -153,9 +153,11 @@ func TestExecutorReattachThawsBeforePrivateRPC(t *testing.T) {
 	_, sup, bridge := usageReattachFixture(t)
 	outer, inner := executorPairForTest(t)
 	var thawed atomic.Bool
+	var calls atomic.Int32
 	server := &innerExecutor{supervisor: sup}
 	serveExecutorForTest(t, outer, noExecutorRequests)
 	serveExecutorForTest(t, inner, func(msg executorMessage, fd *int) (executorMessage, error) {
+		calls.Add(1)
 		if !thawed.Load() {
 			return executorMessage{}, errors.New("requested readiness from frozen inner")
 		}
@@ -174,6 +176,9 @@ func TestExecutorReattachThawsBeforePrivateRPC(t *testing.T) {
 	msg, err := proto.ReadMessage(host)
 	if err != nil || msg.Type != proto.TypeRestoreAck || msg.Epoch != 17 {
 		t.Fatalf("ACK must precede inner MUX frames: %+v, %v", msg, err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("reattach used %d private RPCs", calls.Load())
 	}
 	if bridge.holder.peek() == nil || guestMemReports.isPaused() || client.paused || sup.quiescing.Load() {
 		t.Fatal("ACK/MUX completion did not establish execution and observation readiness")
@@ -230,5 +235,25 @@ func TestExecutorReattachStdioMatchesEstablishedChannels(t *testing.T) {
 		if got, want := client.stdioSpec(), bridge.protoSpec(); got != want {
 			t.Fatalf("reattach stdio = %+v, want %+v", got, want)
 		}
+	}
+}
+
+func TestCombinedReattachFailureKeepsAdmissionClosed(t *testing.T) {
+	outer, inner := executorPairForTest(t)
+	serveExecutorForTest(t, outer, noExecutorRequests)
+	serveExecutorForTest(t, inner, func(msg executorMessage, fd *int) (executorMessage, error) {
+		if msg.Op != "resume_attach" || msg.Request == nil || msg.Request.Type != proto.TypeForkRestoreAck {
+			t.Error("invalid combined request")
+		}
+		return executorMessage{}, errors.New("injected inner readiness failure")
+	})
+	client := &executorClient{link: outer, paused: true}
+	guest, host := usageSocketPair(t)
+	_, err := client.reattachSessionAck(guest, 11, proto.TypeForkRestoreAck)
+	if err == nil || !client.paused {
+		t.Fatal("failure opened admission")
+	}
+	if _, err := proto.ReadMessage(host); err == nil {
+		t.Fatal("failure published ready ACK")
 	}
 }
