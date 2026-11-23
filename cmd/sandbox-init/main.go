@@ -9,6 +9,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -131,6 +132,17 @@ func main() {
 
 	// runtime_ready is the hello itself. The host may defer its launch reply for
 	// an arbitrary assignment interval; that interval is not launch execution.
+	// These are the same immutable runtime binaries for every workload image.
+	// Populate their guest page cache before advertising the generic slot, but
+	// never execute a tenant interpreter or inspect a tenant image here.
+	payloadStart := time.Now()
+	for _, payload := range []string{"/proc/self/exe", "/opt/sandbox-runtime/bin/envd", "/opt/sandbox-runtime/bin/exec-wrapper"} {
+		if f, e := os.Open(payload); e == nil {
+			_, _ = io.Copy(io.Discard, f)
+			_ = f.Close()
+		}
+	}
+	logf("generic runtime payload read completed in %s", time.Since(payloadStart))
 	spec, conn, err := waitForLaunch()
 	if err != nil {
 		die("launch handshake: %v", err)

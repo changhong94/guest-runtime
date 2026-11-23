@@ -1,0 +1,16 @@
+--- a/internal/services/process/handler/handler.go
++++ b/internal/services/process/handler/handler.go
+@@ -101,11 +101,8 @@
+ 	// User command string for logging (without the internal wrapper details).
+ 	userCmd := strings.Join(append([]string{req.GetProcess().GetCmd()}, req.GetProcess().GetArgs()...), " ")
+ 
+-	// Wrap in a shell that resets oom_score_adj, ioprio (ionice best-effort/4), and nice.
+-	niceDelta := defaultNice - currentNice()
+-	oomWrapperScript := fmt.Sprintf(`echo %d > /proc/$$/oom_score_adj && exec /usr/bin/ionice -c 2 -n 4 /usr/bin/nice -n %d "${@}"`, defaultOomScore, niceDelta)
+-	wrapperArgs := append([]string{"-c", oomWrapperScript, "--", req.GetProcess().GetCmd()}, req.GetProcess().GetArgs()...)
+-	cmd := exec.CommandContext(ctx, "/bin/sh", wrapperArgs...)
++	// The trusted runtime helper applies the same policy before exec.
++	cmd := exec.CommandContext(ctx, "/opt/sandbox-runtime/bin/exec-wrapper", append([]string{req.GetProcess().GetCmd()}, req.GetProcess().GetArgs()...)...)
+ 
+ 	uid, gid, err := permissions.GetUserIdUints(user)
+ 	if err != nil {

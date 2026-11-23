@@ -54,13 +54,19 @@ if [ -x "$out_bin" ]; then
     exit 0
 fi
 
-require_cmd go tar
+require_cmd go tar patch
 
 tarball="$(resolve_tarball "$ENVD_TARBALL" "$ENVD_TARBALL_SHA256")"
 extract_tarball "$tarball" "$ENVD_SRC" >/dev/null
 
 envd_dir="$ENVD_SRC/packages/envd"
 [ -f "$envd_dir/main.go" ] || die "$envd_dir/main.go not found (upstream layout changed?)"
+
+# Keep command policy identical while avoiding the sh/ionice/nice exec chain.
+# The helper is built and packaged by guest-runtime alongside envd.
+if ! grep -Fq '"/opt/sandbox-runtime/bin/exec-wrapper"' "$envd_dir/internal/services/process/handler/handler.go"; then
+    patch -d "$envd_dir" -p1 < "$script_dir/envd-patches/0001-runtime-exec-policy-wrapper.patch"
+fi
 
 log "go build envd (GOARCH=$GO_ARCH, CGO disabled)"
 mkdir -p "$BINDIR"

@@ -43,6 +43,8 @@ GO        := go
 GO_BUILD_FLAGS := -trimpath
 
 SANDBOX_INIT  ?= $(BINDIR)/sandbox-init
+WRAPPER_CC    ?= $(if $(filter $(HOST_ARCH),$(TARGET_ARCH)),$(CC),$(if $(filter aarch64,$(TARGET_ARCH)),aarch64-linux-gnu-gcc,x86_64-linux-gnu-gcc))
+EXEC_WRAPPER  ?= $(BINDIR)/exec-wrapper
 ENVD          ?= native-deps/bin/$(TARGET_ARCH)/envd
 FLATTEN_CTL   ?= $(BINDIR)/flatten-ctl
 STORE_CTL     ?= ../accelerator/$(BINDIR)/store-ctl
@@ -91,7 +93,11 @@ vmlinux:
 # shared across sandboxes via host page cache). envd and flatten-ctl
 # are projected into application roots by sandbox-init through
 # /opt/sandbox-runtime/bin.
-sandbox-runtime:
+exec-wrapper:
+	@mkdir -p "$(BINDIR)"
+	$(WRAPPER_CC) -static -Os -s -Wall -Wextra -Werror cmd/exec-wrapper/main.c -o "$(EXEC_WRAPPER)"
+
+sandbox-runtime: exec-wrapper
 	@[ -n "$(BUILD_MKFS_EROFS)" ] || { echo "host mkfs.erofs not found; install erofs-utils or set BUILD_MKFS_EROFS=<host-executable>" >&2; exit 1; }
 	@[ -x "$(SANDBOX_INIT)" ] || $(MAKE) sandbox-init
 	@[ -x "$(ENVD)" ] || $(MAKE) envd
@@ -108,6 +114,7 @@ sandbox-runtime:
 	mkdir -p $(BUILD_DIR)/sandbox-runtime/sysdisks/disk-{0..7}{,-lower,-upper}
 	cp "$(SANDBOX_INIT)" $(BUILD_DIR)/sandbox-runtime/sbin/init
 	chmod +x $(BUILD_DIR)/sandbox-runtime/sbin/init
+	cp "$(EXEC_WRAPPER)" $(BUILD_DIR)/sandbox-runtime/opt/sandbox-runtime/bin/exec-wrapper
 	cp "$(ENVD)" $(BUILD_DIR)/sandbox-runtime/opt/sandbox-runtime/bin/envd
 	cp "$(FLATTEN_CTL)" $(BUILD_DIR)/sandbox-runtime/opt/sandbox-runtime/bin/flatten-ctl
 	chmod 0755 $(BUILD_DIR)/sandbox-runtime/opt/sandbox-runtime/bin/envd \
@@ -210,3 +217,5 @@ help:
 	@echo "  test-release       test both independent release lines"
 	@echo "  clean"
 	@echo "  TARGET_ARCH        x86_64 (default) | aarch64"
+
+.PHONY: exec-wrapper

@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -73,6 +74,14 @@ func applyNetworkMode(spec *proto.NetworkSpec, replace bool) error {
 	if spec == nil {
 		return nil
 	}
+	if spec.MAC != "" {
+		if !replace {
+			return fmt.Errorf("MAC replacement requires fork restore")
+		}
+		if err := validateForkNetwork(spec); err != nil {
+			return err
+		}
+	}
 	if spec.Hostname != "" {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
 			return fmt.Errorf("sethostname %q: %w", spec.Hostname, err)
@@ -110,6 +119,12 @@ func applyNetworkMode(spec *proto.NetworkSpec, replace bool) error {
 	}
 
 	seq := uint32(1)
+	if spec.MAC != "" {
+		mac, _ := net.ParseMAC(spec.MAC) // validated before any mutation
+		if err := nlReplaceMAC(fd, &seq, ifindex, mac); err != nil {
+			return err
+		}
+	}
 
 	if err := nlSendLinkUp(fd, seq, ifindex, spec.MTU); err != nil {
 		return fmt.Errorf("link up %s: %w", iface, err)
@@ -417,3 +432,109 @@ func nlSendAddrDel(fd int, seq uint32, ifindex int32, family int, ip net.IP, pre
 
 // _ keeps the syscall import live in case future revisions need raw fcntls.
 var _ = syscall.SOCK_STREAM
+
+// validateForkNetwork runs before changing the link or thawing the workload.
+func validateForkNetwork(spec *proto.NetworkSpec) error {
+	if spec == nil {
+		return fmt.Errorf("fork restore requires network identity")
+	}
+	mac, err := net.ParseMAC(spec.MAC)
+	if err != nil || len(mac) != 6 || mac[0]&1 != 0 || mac.String() == "00:00:00:00:00:00" {
+		return fmt.Errorf("fork restore requires a unicast Ethernet MAC")
+	}
+	if _, _, err := net.ParseCIDR(spec.IPCIDR); err != nil {
+		return fmt.Errorf("fork restore CIDR: %w", err)
+	}
+	return nil
+}
+
+func nlReplaceMAC(fd int, seq *uint32, ifindex int32, mac net.HardwareAddr) error {
+	// Bring down first: virtio-net can reject an address change while up.
+	for _, address := range []bool{false, true} {
+		body := make([]byte, unix.SizeofIfInfomsg)
+		ifi := (*unix.IfInfomsg)(unsafe.Pointer(&body[0]))
+		ifi.Family = unix.AF_UNSPEC
+		ifi.Index = ifindex
+		ifi.Change = unix.IFF_UP
+		if address {
+			body = nlAttr(body, unix.IFLA_ADDRESS, mac)
+		}
+		if err := nlSend(fd, unix.RTM_NEWLINK, 0, *seq, body); err != nil {
+			return fmt.Errorf("fork MAC reset: %w", err)
+		}
+		*seq++
+	}
+	return nil
+}
+
+// Wildcard TCP listeners and unconnected wildcard UDP sockets survive fork.
+// Explicit bindings survive only when their guest-local address is retained.
+// Connected UDP retains a peer filter, not a TCP session; the independently
+// allocated host network lease supplies its external identity.
+func procSocketIP(raw string) (net.IP, error) {
+	b, err := hex.DecodeString(raw)
+	if err != nil || (len(b) != 4 && len(b) != 16) {
+		return nil, fmt.Errorf("invalid proc socket address")
+	}
+	for i := 0; i < len(b); i += 4 {
+		word := binary.BigEndian.Uint32(b[i : i+4])
+		binary.NativeEndian.PutUint32(b[i:i+4], word)
+	}
+	return net.IP(b), nil
+}
+
+func validateInheritedListeners(read func(string) ([]byte, error), keepIP ...net.IP) error {
+	allowed := func(ip net.IP) bool {
+		if ip.IsUnspecified() || ip.IsLoopback() {
+			return true
+		}
+		for _, keep := range keepIP {
+			if keep != nil && ip.Equal(keep) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, table := range []string{"tcp", "tcp6", "udp", "udp6"} {
+		data, err := read("/proc/net/" + table)
+		if os.IsNotExist(err) && strings.HasSuffix(table, "6") {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("fork inspect %s: %w", table, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) == 0 || !strings.Contains(lines[0], "local_address") {
+			return fmt.Errorf("fork: malformed %s table", table)
+		}
+		for _, line := range lines[1:] {
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			if len(fields) < 4 {
+				return fmt.Errorf("fork: malformed %s record", table)
+			}
+			localRaw, _, lok := strings.Cut(fields[1], ":")
+			remoteRaw, _, rok := strings.Cut(fields[2], ":")
+			local, le := procSocketIP(localRaw)
+			remote, re := procSocketIP(remoteRaw)
+			if !lok || !rok || le != nil || re != nil {
+				return fmt.Errorf("fork: malformed %s address", table)
+			}
+			if strings.HasPrefix(table, "udp") {
+				private := local.IsLoopback() && remote.IsLoopback()
+				unconnected := remote.IsUnspecified() && fields[3] == "07" && allowed(local)
+				connected := fields[3] == "01" && !remote.IsUnspecified() && !remote.IsMulticast() && !local.IsUnspecified() && allowed(local)
+				if !private && !unconnected && !connected {
+					return fmt.Errorf("fork: bound or connected UDP socket needs rebind")
+				}
+				continue
+			}
+			if fields[3] == "0A" && !allowed(local) {
+				return fmt.Errorf("fork: explicitly bound TCP listener needs rebind")
+			}
+		}
+	}
+	return nil
+}

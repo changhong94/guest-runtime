@@ -310,7 +310,7 @@ func cgroupMountScopedWith(
 // after its scoped cgroupfs is mounted. All later starts use
 // CLONE_INTO_CGROUP on the final target and never migrate after birth.
 func cgroupMoveBootstrapToInit() error {
-	return cgroupMoveBootstrapToInitWith(os.WriteFile)
+	return bootstrapRCU(func() error { return cgroupMoveBootstrapToInitWith(os.WriteFile) })
 }
 
 func cgroupMoveBootstrapToInitWith(write func(string, []byte, os.FileMode) error) error {

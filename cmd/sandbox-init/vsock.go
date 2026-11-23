@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -412,7 +413,7 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 		}
 		return handed
 
-	case proto.TypeRestore:
+	case proto.TypeRestore, proto.TypeForkRestore:
 		if execution == nil {
 			_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: "workload not launched"})
 			return false
@@ -444,10 +445,39 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 		// identity). Best-effort + logged, like clock_settime: applied before
 		// the thaw so the app resumes onto the new identity. nil → keep the
 		// snapshot's network.
+		if req.Type == proto.TypeForkRestore {
+			// Workload is frozen and the host TAP remains gated until ACK.
+			var keepIP net.IP
+			if req.Network != nil {
+				keepIP, _, _ = net.ParseCIDR(req.Network.IPCIDR)
+			}
+			if err := validateInheritedListeners(os.ReadFile, keepIP); err != nil {
+				_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+				return false
+			}
+			if err := resetInheritedTCP(); err != nil {
+				_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+				return false
+			}
+			if err := reseedForkKernel(req.ForkEntropy); err != nil {
+				_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+				return false
+			}
+			if req.Network != nil {
+				if err := validateForkNetwork(req.Network); err != nil {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+					return false
+				}
+			}
+		}
 		if req.Network != nil {
 			logf("reverse-channel: restore network re-apply starting (epoch=%d)", req.Epoch)
 			if err := applyNetworkReplace(req.Network); err != nil {
 				logf("reverse-channel: restore applyNetwork: %v", err)
+				if req.Type == proto.TypeForkRestore {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+					return false
+				}
 			} else {
 				logf("reverse-channel: restore network re-applied (epoch=%d)", req.Epoch)
 			}
@@ -463,7 +493,11 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 			return false
 		}
 		logf("reverse-channel: restore mem_report epoch=%d", reportEpoch)
-		handed, err := finishReattach(c, execution, req.Epoch, true, cgroupThaw)
+		ack := proto.TypeRestoreAck
+		if req.Type == proto.TypeForkRestore {
+			ack = proto.TypeForkRestoreAck
+		}
+		handed, err := finishReattachAck(c, execution, req.Epoch, true, cgroupThaw, ack)
 		if err != nil {
 			logf("reverse-channel: %v", err)
 			return handed
@@ -561,9 +595,17 @@ func handleReverseConnShutdown(c *vsockConn, execution executionControl, shutdow
 // finishReattach is the thaw/ACK/MUX boundary. The narrow thaw seam also lets
 // socket tests hold this boundary without freezing the test process's cgroup.
 func finishReattach(c *vsockConn, execution executionControl, epoch uint32, newHost bool, thaw func() error) (_ bool, err error) {
-	ack, operation := proto.TypeAttachAck, "attach"
+	ack := proto.TypeAttachAck
 	if newHost {
-		ack, operation = proto.TypeRestoreAck, "restore"
+		ack = proto.TypeRestoreAck
+	}
+	return finishReattachAck(c, execution, epoch, newHost, thaw, ack)
+}
+
+func finishReattachAck(c *vsockConn, execution executionControl, epoch uint32, newHost bool, thaw func() error, ack string) (_ bool, err error) {
+	operation := "attach"
+	if newHost {
+		operation = "restore"
 	}
 	// The Host starts its immediate usage round as soon as it receives the
 	// ACK. Admit raw reads first; unlike exec and mem_report, these neither

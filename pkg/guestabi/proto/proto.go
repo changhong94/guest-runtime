@@ -247,6 +247,8 @@ type PluginSpec struct {
 // notify) so a clone takes a fresh identity. Empty fields fall back to "skip
 // that step" (empty Nexthop → no default route, MTU 0 → leave kernel default).
 type NetworkSpec struct {
+	// MAC is only applied by the explicit fork_restore protocol before thaw.
+	MAC       string `json:"mac,omitempty"`
 	Interface string `json:"interface,omitempty"`
 	IPCIDR    string `json:"ip_cidr,omitempty"`
 	Nexthop   string `json:"nexthop,omitempty"`
@@ -439,6 +441,8 @@ type Message struct {
 	// this is positive; failure is logged and does not prevent ACK.
 	// Attach omits it for a live VM.
 	WallclockNs int64 `json:"wallclock_ns,omitempty"`
+	// ForkEntropy is fresh host randomness, required by fork_restore.
+	ForkEntropy []byte `json:"fork_entropy,omitempty"`
 
 	// restore: optional new guest IP-layer config. When set, the guest
 	// attempts flush-and-replace before thawing. Failure is logged and does
@@ -484,29 +488,31 @@ const (
 	// Deprecated: binding completes on the host.
 	TypeDiskBind = "disk_bind"
 	// Deprecated: binding completes on the host.
-	TypeDiskBindAck  = "disk_bind_ack"
-	TypeHello        = "hello"
-	TypeLaunch       = "launch"
-	TypeLaunchAck    = "launch_ack"
-	TypeAppStarted   = "app_started"
-	TypeAppExited    = "app_exited"
-	TypeShutdown     = "shutdown" // base/runtime shutdown; reply ack precedes termination
-	TypePing         = "ping"
-	TypePong         = "pong"
-	TypeRestore      = "restore"
-	TypeRestoreAck   = "restore_ack"
-	TypeAttach       = "attach"
-	TypeAttachAck    = "attach_ack"
-	TypeQuiesce      = "quiesce"
-	TypeQuiesced     = "quiesced"
-	TypeExec         = "exec"
-	TypeExecAck      = "exec_ack"
-	TypeConnect      = "connect"
-	TypeConnectAck   = "connect_ack"
-	TypeMemReport    = "mem_report"
-	TypeMemReportAck = "mem_report_ack"
-	TypeAck          = "ack"
-	TypeError        = "error"
+	TypeDiskBindAck    = "disk_bind_ack"
+	TypeHello          = "hello"
+	TypeLaunch         = "launch"
+	TypeLaunchAck      = "launch_ack"
+	TypeAppStarted     = "app_started"
+	TypeAppExited      = "app_exited"
+	TypeShutdown       = "shutdown" // base/runtime shutdown; reply ack precedes termination
+	TypePing           = "ping"
+	TypePong           = "pong"
+	TypeRestore        = "restore"
+	TypeRestoreAck     = "restore_ack"
+	TypeForkRestore    = "fork_restore"
+	TypeForkRestoreAck = "fork_restore_ack"
+	TypeAttach         = "attach"
+	TypeAttachAck      = "attach_ack"
+	TypeQuiesce        = "quiesce"
+	TypeQuiesced       = "quiesced"
+	TypeExec           = "exec"
+	TypeExecAck        = "exec_ack"
+	TypeConnect        = "connect"
+	TypeConnectAck     = "connect_ack"
+	TypeMemReport      = "mem_report"
+	TypeMemReportAck   = "mem_report_ack"
+	TypeAck            = "ack"
+	TypeError          = "error"
 )
 
 // Default per-message deadlines (docs/guest-abi.md#health). Callers
