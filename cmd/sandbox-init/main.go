@@ -237,6 +237,9 @@ func phaseBaseRuntime() error {
 		}
 	}
 
+	if err := configureGuestWriteback(); err != nil {
+		return fmt.Errorf("configure guest writeback: %w", err)
+	}
 	singleDiskRoot = singleDiskFromCmdline() // /proc is mounted now
 	return nil
 }
