@@ -129,7 +129,9 @@ build: vmlinux envd
 
 # --- envd (e2b guest agent; injected into sandbox-runtime.bundle) -----------
 envd: $(ENVD_BIN)
-$(ENVD_BIN):
+.PHONY: envd-force
+envd-force:
+$(ENVD_BIN): envd-force
 	$(DEPS_ENV) \
 	ENVD_TARBALL="$(ENVD_TARBALL)" \
 	ENVD_TARBALL_SHA256="$(ENVD_TARBALL_SHA256)" \

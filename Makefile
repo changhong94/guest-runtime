@@ -104,7 +104,9 @@ image-metadata:
 sandbox-runtime: exec-wrapper image-metadata
 	@[ -n "$(BUILD_MKFS_EROFS)" ] || { echo "host mkfs.erofs not found; install erofs-utils or set BUILD_MKFS_EROFS=<host-executable>" >&2; exit 1; }
 	@[ -x "$(SANDBOX_INIT)" ] || $(MAKE) sandbox-init
-	@[ -x "$(ENVD)" ] || $(MAKE) envd
+	@# Default envd must be rebuilt from patched sources, not an old cached binary.
+	@if [ "$(abspath $(ENVD))" = "$(abspath native-deps/bin/$(TARGET_ARCH)/envd)" ]; then $(MAKE) envd; fi
+	@[ -x "$(ENVD)" ] || { echo "selected ENVD is not executable: $(ENVD)" >&2; exit 1; }
 	@[ -x "$(FLATTEN_CTL)" ] || $(MAKE) flatten-ctl
 	@set -o pipefail; $(GO) version -m "$(FLATTEN_CTL)" | awk -F '\t' '\
 	  $$2 == "dep" && $$3 == "github.com/kuasar-sandbox/go-erofs" && $$4 ~ /^v/ && $$5 ~ /^h1:/ { found++ } \

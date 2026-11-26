@@ -27,8 +27,9 @@
 # database — keep GOSUMDB enabled (Go refuses to download+run a toolchain when
 # GOSUMDB=off). Toolchain + module fetches use the ambient Go environment.
 #
-# Idempotent: if $BINDIR/envd already exists it exits 0 without rebuilding.
-# Delete it to force.
+# Always validate patched sources and invoke Go, even when the output exists.
+# Go's content-addressed build cache handles unchanged inputs; file existence
+# alone cannot prove that an envd binary contains the current runtime patches.
 
 set -euo pipefail
 
@@ -49,10 +50,6 @@ if [ "${KUASAR_BUILD_JOBS+x}" ]; then
 fi
 
 out_bin="$BINDIR/envd"
-if [ -x "$out_bin" ]; then
-    log "already built: $out_bin (delete it to force rebuild)"
-    exit 0
-fi
 
 require_cmd go tar patch
 
@@ -82,12 +79,18 @@ fi
 
 log "go build envd (GOARCH=$GO_ARCH, CGO disabled)"
 mkdir -p "$BINDIR"
+staged_bin="$(mktemp "$BINDIR/.envd.XXXXXX")"
+trap 'rm -f "$staged_bin"' EXIT
 (
     cd "$envd_dir"
     GOWORK=off GOOS=linux GOARCH="$GO_ARCH" CGO_ENABLED=0 \
         GOFLAGS="${ENVD_GOFLAGS:--mod=mod}" \
-        go build "${build_args[@]}" -trimpath -ldflags "-s -w" -o "$out_bin" .
+        go build "${build_args[@]}" -trimpath -ldflags "-s -w" -o "$staged_bin" .
 )
+
+chmod 0755 "$staged_bin"
+mv -f "$staged_bin" "$out_bin"
+trap - EXIT
 
 log "built $out_bin"
 file "$out_bin" 2>&1 | head -1 || true
